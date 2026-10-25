@@ -1,0 +1,64 @@
+name: Build APK & Run Apple Store Deal Monitor
+
+on:
+  push:
+  workflow_dispatch:
+  schedule:
+    # 雲端機器人：每 2 小時自動巡邏一次 Apple App Store 價格
+    - cron: '0 */2 * * *'
+
+jobs:
+  # 任務 A：執行 Python 雲端查價與 LINE / Telegram / Discord 自動推播
+  cloud-deal-monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Apple Store Price & Free Deal Radar
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+        run: |
+          MONITOR_SCRIPT=$(find . -name "monitor.py" | head -n 1)
+          if [ -n "$MONITOR_SCRIPT" ]; then
+            python3 "$MONITOR_SCRIPT"
+          fi
+
+  # 任務 B：當您上傳或手動觸發時，自動幫您編譯 Android APK
+  build-android-apk:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.4'
+
+      - name: Auto-locate project and Build APK
+        run: |
+          SETTINGS_FILE=$(find . -name "settings.gradle" | head -n 1)
+          if [ -z "$SETTINGS_FILE" ]; then
+            echo "❌ 找不到 settings.gradle"
+            exit 1
+          fi
+          cd "$(dirname "$SETTINGS_FILE")"
+          gradle assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppStoreDealsRadar-APK
+          path: "**/app-debug.apk"

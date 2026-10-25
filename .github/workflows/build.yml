@@ -4,11 +4,9 @@ on:
   push:
   workflow_dispatch:
   schedule:
-    # 雲端機器人：每 2 小時自動巡邏一次 Apple App Store 價格
     - cron: '0 */2 * * *'
 
 jobs:
-  # 任務 A：執行 Python 雲端查價與 LINE / Telegram / Discord 自動推播
   cloud-deal-monitor:
     runs-on: ubuntu-latest
     steps:
@@ -28,7 +26,6 @@ jobs:
             python3 "$MONITOR_SCRIPT"
           fi
 
-  # 任務 B：當您上傳或手動觸發時，自動幫您編譯 Android APK
   build-android-apk:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
@@ -47,14 +44,391 @@ jobs:
         with:
           gradle-version: '8.4'
 
-      - name: Auto-locate project and Build APK
+      - name: Auto-fix Kotlin syntax and Build APK
         run: |
           SETTINGS_FILE=$(find . -name "settings.gradle" | head -n 1)
           if [ -z "$SETTINGS_FILE" ]; then
-            echo "❌ 找不到 settings.gradle"
+            echo "❌ 找不到 settings.gradle，請確認有上傳專案檔案！"
             exit 1
           fi
-          cd "$(dirname "$SETTINGS_FILE")"
+          PROJECT_DIR=$(dirname "$SETTINGS_FILE")
+          cd "$PROJECT_DIR"
+
+          # 自動將 MainActivity.kt 更新為 100% 嚴格型別相容版
+          MAIN_KT=$(find . -name "MainActivity.kt" | head -n 1)
+          if [ -n "$MAIN_KT" ]; then
+            cat << 'EOF' > "$MAIN_KT"
+          package com.example.appstoredeals
+
+          import android.app.AlertDialog
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.content.Context
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.widget.AdapterView
+          import android.widget.ArrayAdapter
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.ListView
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.app.NotificationCompat
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import org.xmlpull.v1.XmlPullParser
+          import org.xmlpull.v1.XmlPullParserFactory
+          import java.io.StringReader
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.net.URLEncoder
+          import kotlin.concurrent.thread
+
+          data class DealItem(
+              val title: String,
+              val subtitle: String,
+              val link: String,
+              val trackId: Long = 0L,
+              val currentPrice: Double = -1.0
+          )
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var tvStatus: TextView
+              private lateinit var listDeals: ListView
+              private lateinit var etSearch: EditText
+              private val currentItems = mutableListOf<DealItem>()
+              private lateinit var listAdapter: ArrayAdapter<String>
+              private val displayStrings = mutableListOf<String>()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_main)
+
+                  tvStatus = findViewById(R.id.tv_status)
+                  listDeals = findViewById(R.id.list_deals)
+                  etSearch = findViewById(R.id.et_search_app)
+
+                  listAdapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, displayStrings)
+                  listDeals.adapter = listAdapter
+
+                  createNotificationChannel()
+                  initDefaultWatchlist()
+
+                  listDeals.onItemClickListener = AdapterView.OnItemClickListener { _, _, position, _ ->
+                      if (position in currentItems.indices) {
+                          val item = currentItems[position]
+                          if (item.link.isNotEmpty()) {
+                              try {
+                                  startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(item.link)))
+                              } catch ( ignored: Exception) {}
+                          }
+                      }
+                  }
+
+                  listDeals.onItemLongClickListener = AdapterView.OnItemLongClickListener { _, _, position, _ ->
+                      if (position in currentItems.indices) {
+                          val item = currentItems[position]
+                          if (item.trackId > 0L) {
+                              AlertDialog.Builder(this)
+                                  .setTitle("移除追蹤")
+                                  .setMessage("確定要將「" + item.title + "」從追蹤清單移除嗎？")
+                                  .setPositiveButton("移除") { _, _ ->
+                                      removeFromWatchlist(item.trackId)
+                                      loadWatchlistPrices()
+                                  }
+                                  .setNegativeButton("取消", null)
+                                  .show()
+                          }
+                      }
+                      true
+                  }
+
+                  findViewById<Button>(R.id.btn_tab_free).setOnClickListener {
+                      loadDailyFreeDeals()
+                  }
+
+                  findViewById<Button>(R.id.btn_tab_watchlist).setOnClickListener {
+                      loadWatchlistPrices()
+                  }
+
+                  findViewById<Button>(R.id.btn_search_add).setOnClickListener {
+                      val query = etSearch.text.toString().trim()
+                      if (query.isEmpty()) {
+                          Toast.makeText(this, "請輸入要查詢的 App 名稱", Toast.LENGTH_SHORT).show()
+                      } else {
+                          searchAppStoreAndPrompt(query)
+                      }
+                  }
+
+                  loadDailyFreeDeals()
+              }
+
+              private fun initDefaultWatchlist() {
+                  val prefs = getSharedPreferences("watchlist", Context.MODE_PRIVATE)
+                  if (!prefs.contains("apps_json")) {
+                      val defaultArr = JSONArray()
+                      defaultArr.put(JSONObject().put("trackId", 1444383602L).put("name", "Goodnotes 6").put("lastPrice", 0.0))
+                      defaultArr.put(JSONObject().put("trackId", 424293657L).put("name", "LumaFusion").put("lastPrice", 990.0))
+                      defaultArr.put(JSONObject().put("trackId", 936243218L).put("name", "Forest 專注森林").put("lastPrice", 130.0))
+                      prefs.edit().putString("apps_json", defaultArr.toString()).apply()
+                  }
+              }
+
+              private fun loadDailyFreeDeals() {
+                  tvStatus.text = "🔄 正在從全球限免情報源抓取最新 Apple Store 限時免費軟體..."
+                  thread {
+                      val fetched = mutableListOf<DealItem>()
+                      try {
+                          val url = URL("https://www.reddit.com/r/apphookup/new/.rss")
+                          val conn = (url.openConnection() as HttpURLConnection)
+                          conn.requestMethod = "GET"
+                          conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppStoreDealsRadar/1.0")
+                          conn.connectTimeout = 10000
+                          conn.readTimeout = 10000
+
+                          val xmlStr = conn.inputStream.bufferedReader().readText()
+                          val factory = XmlPullParserFactory.newInstance()
+                          val parser = factory.newPullParser()
+                          parser.setInput(StringReader(xmlStr))
+
+                          var eventType = parser.eventType
+                          var insideEntry = false
+                          var title = ""
+                          var link = ""
+
+                          while (eventType != XmlPullParser.END_DOCUMENT) {
+                              val tagName = parser.name ?: ""
+                              if (eventType == XmlPullParser.START_TAG) {
+                                  if (tagName.equals("entry", true) || tagName.equals("item", true)) {
+                                      insideEntry = true
+                                      title = ""
+                                      link = ""
+                                  } else if (insideEntry && tagName.equals("title", true)) {
+                                      title = parser.nextText()
+                                  } else if (insideEntry && tagName.equals("link", true)) {
+                                      val href = parser.getAttributeValue(null, "href")
+                                      link = href ?: parser.nextText()
+                                  }
+                              } else if (eventType == XmlPullParser.END_TAG) {
+                                  if (tagName.equals("entry", true) || tagName.equals("item", true)) {
+                                      insideEntry = false
+                                      if (title.contains("iOS", true) ||
+                                          title.contains("Mac", true) ||
+                                          title.contains("Apple", true) ||
+                                          title.contains("Free", true) ||
+                                          title.contains("$0", true)
+                                      ) {
+                                          val badge = if (title.contains("$0") || title.contains("Free", true)) "🎁 [限時免費]" else "🏷️ [特價情報]"
+                                          fetched.add(DealItem("$badge $title", "點擊前往領取/查看詳情", link))
+                                      }
+                                  }
+                              }
+                              eventType = parser.next()
+                          }
+                      } catch (e: Exception) {
+                          fetched.add(DealItem("⚠️ 無法連線至外部情報源", "請點選右上方「我的追蹤清單」直接查詢 Apple 官方 API", ""))
+                      }
+
+                      runOnUiThread {
+                          currentItems.clear()
+                          currentItems.addAll(fetched)
+                          displayStrings.clear()
+                          for (item in currentItems) {
+                              displayStrings.add(item.title + "\n👉 " + item.subtitle)
+                          }
+                          listAdapter.notifyDataSetChanged()
+                          tvStatus.text = "✅ 已更新最新 Apple 限免與特價情報 (共 " + fetched.size + " 筆，點擊可直接開啟)"
+                      }
+                  }
+              }
+
+              private fun loadWatchlistPrices() {
+                  val prefs = getSharedPreferences("watchlist", Context.MODE_PRIVATE)
+                  val jsonStr = prefs.getString("apps_json", "[]") ?: "[]"
+                  val arr = JSONArray(jsonStr)
+                  if (arr.length() == 0) {
+                      tvStatus.text = "目前追蹤清單為空，請在上方輸入軟體名稱加入！"
+                      currentItems.clear()
+                      displayStrings.clear()
+                      listAdapter.notifyDataSetChanged()
+                      return
+                  }
+
+                  tvStatus.text = "🔄 正在連線 Apple 官方伺服器 (iTunes API 台灣區) 檢查最新售價..."
+                  thread {
+                      val ids = mutableListOf<Long>()
+                      val lastPriceMap = mutableMapOf<Long, Double>()
+                      for (i in 0 until arr.length()) {
+                          val obj = arr.getJSONObject(i)
+                          val id = obj.getLong("trackId")
+                          ids.add(id)
+                          lastPriceMap[id] = obj.optDouble("lastPrice", -1.0)
+                      }
+
+                      val idParam = ids.joinToString(",")
+                      val fetched = mutableListOf<DealItem>()
+
+                      try {
+                          val apiUrl = "https://itunes.apple.com/lookup?id=$idParam&country=tw"
+                          val jsonText = URL(apiUrl).readText()
+                          val root = JSONObject(jsonText)
+                          val results = root.getJSONArray("results")
+
+                          for (i in 0 until results.length()) {
+                              val item = results.getJSONObject(i)
+                              val trackId = item.getLong("trackId")
+                              val name = item.getString("trackName")
+                              val price = item.optDouble("price", 0.0)
+                              val formattedPrice = item.optString("formattedPrice", "NT$ $price")
+                              val storeUrl = item.optString("trackViewUrl", "")
+                              val oldPrice = lastPriceMap[trackId] ?: price
+
+                              val statusTag = when {
+                                  price == 0.0 -> "🎉 【目前免費 Free！】"
+                                  oldPrice > 0.0 && price < oldPrice -> "🔥 【降價特價中！(原 NT$$oldPrice -> $formattedPrice)】"
+                                  else -> "💰 目前售價：$formattedPrice"
+                              }
+
+                              if (price == 0.0 && oldPrice > 0.0) {
+                                  sendDealNotification("🎁 限免警報：$name", "原本 NT$$oldPrice，現在變成限時免費 ($0)！")
+                              } else if (oldPrice > 0.0 && price < oldPrice) {
+                                  sendDealNotification("📉 降價通知：$name", "價格從 NT$$oldPrice 降至 $formattedPrice！")
+                              }
+
+                              fetched.add(
+                                  DealItem(
+                                      title = "$name  —  $statusTag",
+                                      subtitle = "點擊直接開啟 Apple App Store 頁面 (長按可移除追蹤)",
+                                      link = storeUrl,
+                                      trackId = trackId,
+                                      currentPrice = price
+                                  )
+                              )
+                          }
+                      } catch (e: Exception) {
+                          fetched.add(DealItem("⚠️ 查詢 Apple 官方 API 失敗", e.localizedMessage ?: "", ""))
+                      }
+
+                      runOnUiThread {
+                          currentItems.clear()
+                          currentItems.addAll(fetched)
+                          displayStrings.clear()
+                          for (item in currentItems) {
+                              displayStrings.add(item.title + "\n👉 " + item.subtitle)
+                          }
+                          listAdapter.notifyDataSetChanged()
+                          tvStatus.text = "⭐ 我的追蹤清單已更新 (點擊跳轉 App Store，長按可刪除)"
+                      }
+                  }
+              }
+
+              private fun searchAppStoreAndPrompt(keyword: String) {
+                  tvStatus.text = "🔍 正在 Apple App Store (台灣區) 搜尋「$keyword」..."
+                  thread {
+                      try {
+                          val encoded = URLEncoder.encode(keyword, "UTF-8")
+                          val searchUrl = "https://itunes.apple.com/search?term=$encoded&country=tw&entity=software&limit=8"
+                          val jsonText = URL(searchUrl).readText()
+                          val results = JSONObject(jsonText).getJSONArray("results")
+
+                          if (results.length() == 0) {
+                              runOnUiThread {
+                                  Toast.makeText(this, "找不到相關 iOS 軟體", Toast.LENGTH_SHORT).show()
+                                  tvStatus.text = "找不到「$keyword」的相關結果"
+                              }
+                              return@thread
+                          }
+
+                          val names = Array(results.length()) { i ->
+                              val obj = results.getJSONObject(i)
+                              val title = obj.getString("trackName")
+                              val price = obj.optString("formattedPrice", "免費")
+                              val dev = obj.optString("sellerName", "")
+                              "$title ($price) - $dev"
+                          }
+
+                          runOnUiThread {
+                              tvStatus.text = "請選擇要加入價格追蹤的 App："
+                              AlertDialog.Builder(this)
+                                  .setTitle("選擇要追蹤特價/限免的 App")
+                                  .setItems(names) { _, which ->
+                                      val chosen = results.getJSONObject(which)
+                                      addToWatchlist(
+                                          chosen.getLong("trackId"),
+                                          chosen.getString("trackName"),
+                                          chosen.optDouble("price", 0.0)
+                                      )
+                                      loadWatchlistPrices()
+                                  }
+                                  .setNegativeButton("取消", null)
+                                  .show()
+                          }
+                      } catch (e: Exception) {
+                          runOnUiThread {
+                              Toast.makeText(this, "搜尋失敗", Toast.LENGTH_SHORT).show()
+                          }
+                      }
+                  }
+              }
+
+              private fun addToWatchlist(trackId: Long, name: String, price: Double) {
+                  val prefs = getSharedPreferences("watchlist", Context.MODE_PRIVATE)
+                  val jsonStr = prefs.getString("apps_json", "[]") ?: "[]"
+                  val arr = JSONArray(jsonStr)
+                  for (i in 0 until arr.length()) {
+                      if (arr.getJSONObject(i).getLong("trackId") == trackId) {
+                          Toast.makeText(this, "「$name」已經在追蹤清單中囉！", Toast.LENGTH_SHORT).show()
+                          return
+                      }
+                  }
+                  arr.put(JSONObject().put("trackId", trackId).put("name", name).put("lastPrice", price))
+                  prefs.edit().putString("apps_json", arr.toString()).apply()
+                  Toast.makeText(this, "✅ 已將「$name」加入限免/降價追蹤！", Toast.LENGTH_SHORT).show()
+              }
+
+              private fun removeFromWatchlist(trackId: Long) {
+                  val prefs = getSharedPreferences("watchlist", Context.MODE_PRIVATE)
+                  val jsonStr = prefs.getString("apps_json", "[]") ?: "[]"
+                  val arr = JSONArray(jsonStr)
+                  val newArr = JSONArray()
+                  for (i in 0 until arr.length()) {
+                      val obj = arr.getJSONObject(i)
+                      if (obj.getLong("trackId") != trackId) {
+                          newArr.put(obj)
+                      }
+                  }
+                  prefs.edit().putString("apps_json", newArr.toString()).apply()
+              }
+
+              private fun createNotificationChannel() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val channel = NotificationChannel(
+                          "appstore_deals_channel",
+                          "App Store 限免與特價通知",
+                          NotificationManager.IMPORTANCE_HIGH
+                      )
+                      getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+                  }
+              }
+
+              private fun sendDealNotification(title: String, message: String) {
+                  val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  val builder = NotificationCompat.Builder(this, "appstore_deals_channel")
+                      .setSmallIcon(android.R.drawable.ic_dialog_info)
+                      .setContentTitle(title)
+                      .setContentText(message)
+                      .setPriority(NotificationCompat.PRIORITY_HIGH)
+                      .setAutoCancel(true)
+                  nm.notify(System.currentTimeMillis().toInt(), builder.build())
+              }
+          }
+          EOF
+          fi
+
           gradle assembleDebug --stacktrace
 
       - name: Upload APK

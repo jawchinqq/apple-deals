@@ -1,0 +1,21 @@
+{
+  "country": "tw",
+  "enable_global_free_radar": true,
+  "watchlist_apps": [
+    {
+      "name": "LumaFusion (專業影片剪輯)",
+      "trackId": 424293657,
+      "target_price": 600
+    },
+    {
+      "name": "Forest 專注森林",
+      "trackId": 936243218,
+      "target_price": 0
+    },
+    {
+      "name": "Procreate Pocket",
+      "trackId": 916366645,
+      "target_price": 100
+    }
+  ]
+}
